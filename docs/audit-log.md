@@ -1,26 +1,31 @@
 # Audit Log
 
-Every versioned mutation writes an immutable `OperationRecord`. Operation records are the Phase 1 audit trail and are intended to become the input for future synchronization work, but this phase does not implement networking, replication, consensus, or conflict resolution.
+Every versioned mutation writes an immutable `OperationRecord`. Operation records are the Phase 1 audit trail and are intended to support future synchronization work, but this phase does not implement networking, replication, consensus, or conflict resolution.
 
 ## Operation records
 
-An operation record contains an operation ID, type, logical key, resulting version ID, timestamp, and host ID. The operation ID is unique and stable, allowing external tools to correlate operation records with version records.
+Operation records contain operation ID, type, original key, encoded key, resulting version ID, parent version ID, host ID, logical clock, wall-clock timestamp, value hash and size, tombstone state, priority metadata fields, export status, and extensible metadata.
 
-## Audit API
+## Global and per-key logs
 
-`Audit(key)` scans operation records for the logical key in timestamp order. The operation log is append-only: update, delete, and rollback operations add records instead of modifying or removing prior records.
+Each mutation writes three operation indexes:
+
+```text
+/ops/global/{logicalClock}-{operationID}
+/ops/by-key/{encodedKey}/{logicalClock}-{operationID}
+/ops/by-id/{operationID}
+```
+
+`ListOperations` scans the global ordered stream. `ListOperationsSince` resumes from a logical clock checkpoint. `GetOperation` retrieves a stable operation by ID. `Audit(key)` remains a per-key operation scan.
+
+## Export states
+
+Operation export state is durable and may be `pending`, `exported`, `failed`, or `skipped`. Database mutations succeed independently of export by default. Strict export mode can opt into returning export failures from mutations.
+
+APIs include `ListExportPending`, `ListExportFailed`, `RetryExport`, `MarkExported`, and `MarkExportFailed`. Export errors are truncated before storage to reduce accidental leakage.
 
 ## Optional audit exporters
 
-The `AuditExporter` interface mirrors authoritative Badger history to external audit targets:
+The `AuditExporter` interface mirrors authoritative Badger history to external audit targets. `FilesystemExporter` writes readable JSON files under `history/` and `ops/`. `GitExporter` writes the same files in a Git worktree and can commit each operation. `SoftServeExporter` treats Soft Serve as a normal SSH Git remote.
 
-```go
-type AuditExporter interface {
-    ExportOperation(OperationRecord) error
-    ExportVersion(VersionRecord) error
-}
-```
-
-`FilesystemExporter` writes readable JSON files under `history/` and `ops/`. `GitExporter` writes the same files in a Git worktree and can commit each operation. `SoftServeExporter` is a Git-compatible wrapper intended for worktrees configured with Soft Serve remotes.
-
-Git and Soft Serve are optional audit mirrors only. BadgerDB remains authoritative, and the database works without Git.
+Git and Soft Serve are audit mirrors only. They are not database replication or synchronization.
