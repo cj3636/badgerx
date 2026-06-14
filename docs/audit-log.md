@@ -20,7 +20,7 @@ Each mutation writes three operation indexes:
 
 ## Export states
 
-Operation export state is durable and may be `pending`, `exported`, `failed`, or `skipped`. Database mutations succeed independently of export by default. Strict export mode can opt into returning export failures from mutations.
+Operation export state is durable and indexed under `/export/state/{state}/` for efficient pending/failed/exported/skipped scans. State may be `pending`, `exported`, `failed`, or `skipped`. Database mutations succeed independently of export by default. Strict export mode can opt into returning export failures from mutations.
 
 APIs include `ListExportPending`, `ListExportFailed`, `RetryExport`, `MarkExported`, and `MarkExportFailed`. Export errors are truncated before storage to reduce accidental leakage.
 

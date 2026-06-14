@@ -261,3 +261,38 @@ func TestExportFailureRetryAndGitStatusPushFailure(t *testing.T) {
 	require.Equal(t, 1, st.PendingExports)
 	require.ErrorIs(t, ge.GitPush("", ""), ErrRemoteNotConfigured)
 }
+
+func TestExportStateIndexTransitions(t *testing.T) {
+	raw, err := badger.Open(badger.DefaultOptions(t.TempDir()).WithLogger(nil))
+	require.NoError(t, err)
+	defer raw.Close()
+	db, err := Open(raw, WithAuditExporter(failingExporter{}))
+	require.NoError(t, err)
+	rec, err := db.Put("alpha", []byte("one"))
+	require.NoError(t, err)
+	pending, err := db.ListExportPending(10)
+	require.NoError(t, err)
+	require.Len(t, pending, 0)
+	failed, err := db.ListExportFailed(10)
+	require.NoError(t, err)
+	require.Len(t, failed, 1)
+	require.NoError(t, db.MarkExported(rec.OperationID, map[string]string{"manual": "true"}))
+	failed, err = db.ListExportFailed(10)
+	require.NoError(t, err)
+	require.Len(t, failed, 0)
+	exported, err := db.ListExportState(ExportExported, 10)
+	require.NoError(t, err)
+	require.Len(t, exported, 1)
+	require.Equal(t, "true", exported[0].Metadata["manual"])
+}
+
+func TestOpenRejectsLegacyLayoutWithoutMigration(t *testing.T) {
+	raw, err := badger.Open(badger.DefaultOptions(t.TempDir()).WithLogger(nil))
+	require.NoError(t, err)
+	require.NoError(t, raw.Update(func(txn *badger.Txn) error {
+		return txn.Set([]byte("/data/current/legacy-key"), []byte(`{"key":"legacy-key"}`))
+	}))
+	_, err = Open(raw)
+	require.ErrorIs(t, err, ErrIncompatibleSchema)
+	require.NoError(t, raw.Close())
+}

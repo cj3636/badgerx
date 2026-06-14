@@ -6,7 +6,7 @@ Git export is optional and non-authoritative. BadgerDB remains the source of tru
 
 `FilesystemExporter` writes JSON version files under `history/{encodedKey}/` and operation files under `ops/`. `GitExporter` writes the same files in a Git worktree and can commit each exported operation.
 
-Database writes do not depend on export success unless strict export mode is explicitly enabled. Failed exports are recorded durably in operation records and can be listed or retried.
+Database writes do not depend on export success unless strict export mode is explicitly enabled. Failed exports are recorded durably in operation records, indexed by export state, and can be listed or retried. The CLI `badger git export` command retries pending exports and, by default, failed exports.
 
 ## Status and push
 

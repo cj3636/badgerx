@@ -47,6 +47,7 @@ var (
 	ErrReadOnly            = errors.New("versioning: database opened read-only")
 	ErrInvalidHostID       = errors.New("versioning: invalid host id")
 	ErrInvalidEncodedKey   = errors.New("versioning: invalid encoded key")
+	ErrIncompatibleSchema  = errors.New("versioning: incompatible schema; explicit migration required")
 )
 
 var hostIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$`)
@@ -278,7 +279,7 @@ func (v *DB) mutate(key string, value []byte, op string, tombstone bool, rollbac
 		for _, p := range []struct {
 			k   []byte
 			val any
-		}{{versionKey(encoded, vid), rec}, {historyKey(encoded, clock, vid), rec}, {currentKey(encoded), rec}, {globalOpKey(clock, oid), oprec}, {opByKeyKey(encoded, clock, oid), oprec}, {opByIDKey(oid), oprec}} {
+		}{{versionKey(encoded, vid), rec}, {historyKey(encoded, clock, vid), rec}, {currentKey(encoded), rec}, {globalOpKey(clock, oid), oprec}, {opByKeyKey(encoded, clock, oid), oprec}, {opByIDKey(oid), oprec}, {exportStateKey(oprec.ExportState, clock, oid), oprec}} {
 			if err := setJSON(txn, p.k, p.val); err != nil {
 				return err
 			}
@@ -345,21 +346,28 @@ func (v *DB) ListExportPending(limit int) ([]OperationRecord, error) {
 func (v *DB) ListExportFailed(limit int) ([]OperationRecord, error) {
 	return v.listExportState(ExportFailed, limit)
 }
+func (v *DB) ListExportState(state string, limit int) ([]OperationRecord, error) {
+	return v.listExportState(state, limit)
+}
 func (v *DB) listExportState(state string, limit int) ([]OperationRecord, error) {
-	ops, err := v.ListOperations(OperationListOptions{})
-	if err != nil {
-		return nil, err
-	}
 	out := []OperationRecord{}
-	for _, op := range ops {
-		if op.ExportState == state {
+	prefix := exportStatePrefix(state)
+	err := v.db.View(func(txn *badger.Txn) error {
+		it := txn.NewIterator(badger.DefaultIteratorOptions)
+		defer it.Close()
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			var op OperationRecord
+			if err := it.Item().Value(func(val []byte) error { return json.Unmarshal(val, &op) }); err != nil {
+				return err
+			}
 			out = append(out, op)
 			if limit > 0 && len(out) >= limit {
 				break
 			}
 		}
-	}
-	return out, nil
+		return nil
+	})
+	return out, err
 }
 func (v *DB) RetryExport(operationID string) error {
 	if v.exporter == nil {
@@ -388,7 +396,7 @@ func (v *DB) MarkExported(operationID string, metadata map[string]string) error 
 		op.ExportState = ExportExported
 		op.ExportedAtUnixNano = time.Now().UnixNano()
 		op.ExportError = ""
-		merge(op.Metadata, metadata)
+		merge(&op.Metadata, metadata)
 	})
 }
 func (v *DB) MarkExportFailed(operationID string, err error) error {
@@ -408,12 +416,18 @@ func (v *DB) updateOperation(operationID string, fn func(*OperationRecord)) erro
 			}
 			return err
 		}
+		oldState := op.ExportState
 		fn(&op)
+		if oldState != "" && oldState != op.ExportState {
+			if err := txn.Delete(exportStateKey(oldState, op.LogicalClock, op.OperationID)); err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
+				return err
+			}
+		}
 		return writeOpIndexes(txn, op)
 	})
 }
 func writeOpIndexes(txn *badger.Txn, op OperationRecord) error {
-	for _, k := range [][]byte{opByIDKey(op.OperationID), globalOpKey(op.LogicalClock, op.OperationID), opByKeyKey(op.EncodedKey, op.LogicalClock, op.OperationID)} {
+	for _, k := range [][]byte{opByIDKey(op.OperationID), globalOpKey(op.LogicalClock, op.OperationID), opByKeyKey(op.EncodedKey, op.LogicalClock, op.OperationID), exportStateKey(op.ExportState, op.LogicalClock, op.OperationID)} {
 		if err := setJSON(txn, k, op); err != nil {
 			return err
 		}
@@ -445,6 +459,15 @@ func (v *DB) initMetadata() error {
 		err := getJSON(txn, metaHostKey(), &meta)
 		if err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
 			return err
+		}
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			legacy, legacyErr := hasAny(txn, currentRawPrefix(), legacyOpsByKeyPrefix())
+			if legacyErr != nil {
+				return legacyErr
+			}
+			if legacy {
+				return ErrIncompatibleSchema
+			}
 		}
 		if v.hostID != "" {
 			if !ValidHostID(v.hostID) {
@@ -546,12 +569,15 @@ func copyMap(in map[string]string) map[string]string {
 	}
 	return out
 }
-func merge(dst, src map[string]string) {
-	if dst == nil || src == nil {
+func merge(dst *map[string]string, src map[string]string) {
+	if src == nil {
 		return
 	}
+	if *dst == nil {
+		*dst = map[string]string{}
+	}
 	for k, v := range src {
-		dst[k] = v
+		(*dst)[k] = v
 	}
 }
 func setJSON(txn *badger.Txn, key []byte, val any) error {
@@ -568,6 +594,19 @@ func getJSON(txn *badger.Txn, key []byte, dst any) error {
 	}
 	return item.Value(func(v []byte) error { return json.Unmarshal(v, dst) })
 }
+func hasAny(txn *badger.Txn, prefixes ...[]byte) (bool, error) {
+	it := txn.NewIterator(badger.DefaultIteratorOptions)
+	defer it.Close()
+	for _, prefix := range prefixes {
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			key := it.Item().Key()
+			if bytes.HasPrefix(key, []byte("/data/current/")) || bytes.HasPrefix(key, []byte("/ops/by-key/")) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
 func currentKey(e string) []byte      { return []byte("/data/current/" + e) }
 func versionKey(e, vid string) []byte { return []byte("/data/version/" + e + "/" + vid) }
 func historyPrefix(e string) []byte   { return []byte("/data/history/" + e + "/") }
@@ -583,12 +622,18 @@ func opsByKeyPrefix(e string) []byte { return []byte("/ops/by-key/" + e + "/") }
 func opByKeyKey(e string, c uint64, oid string) []byte {
 	return []byte(fmt.Sprintf("/ops/by-key/%s/%020d-%s", e, c, oid))
 }
-func opByIDKey(oid string) []byte { return []byte("/ops/by-id/" + oid) }
-func metaHostKey() []byte         { return []byte("/meta/host") }
-func clockKey() []byte            { return []byte("/meta/clock/local") }
-func schemaVersionKey() []byte    { return []byte("/meta/schema/version") }
-func hashValue(v []byte) string   { h := sha256.Sum256(v); return hex.EncodeToString(h[:]) }
-func randomHex(n int) string      { b := make([]byte, n); _, _ = rand.Read(b); return hex.EncodeToString(b) }
+func opByIDKey(oid string) []byte           { return []byte("/ops/by-id/" + oid) }
+func metaHostKey() []byte                   { return []byte("/meta/host") }
+func clockKey() []byte                      { return []byte("/meta/clock/local") }
+func schemaVersionKey() []byte              { return []byte("/meta/schema/version") }
+func exportStatePrefix(state string) []byte { return []byte("/export/state/" + state + "/") }
+func exportStateKey(state string, c uint64, oid string) []byte {
+	return []byte(fmt.Sprintf("/export/state/%s/%020d-%s", state, c, oid))
+}
+func currentRawPrefix() []byte     { return []byte("/data/current/") }
+func legacyOpsByKeyPrefix() []byte { return []byte("/ops/by-key/") }
+func hashValue(v []byte) string    { h := sha256.Sum256(v); return hex.EncodeToString(h[:]) }
+func randomHex(n int) string       { b := make([]byte, n); _, _ = rand.Read(b); return hex.EncodeToString(b) }
 func defaultHostName() string {
 	h, _ := os.Hostname()
 	if h == "" {

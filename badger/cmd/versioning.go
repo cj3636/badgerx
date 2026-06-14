@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
+	"strings"
 
 	badger "github.com/dgraph-io/badger/v4"
 	"github.com/dgraph-io/badger/v4/versioning"
@@ -23,6 +25,9 @@ var vcsYes bool
 var vcsAuditDir string
 var vcsRemote string
 var vcsBranch string
+var vcsValueFile string
+var vcsValueStdin bool
+var vcsIncludeFailed bool
 
 func init() {
 	for _, c := range []*cobra.Command{versionCmd, auditCmd, gitCmd, softServeCmd} {
@@ -32,30 +37,37 @@ func init() {
 		c.PersistentFlags().BoolVar(&vcsYes, "yes", false, "confirm destructive operations")
 	}
 	versionCmd.PersistentFlags().StringVar(&vcsValueOutput, "value-output", "text", "value output: text|raw|hex|base64|json")
+	versionPutCmd.Flags().StringVar(&vcsValueFile, "value-file", "", "read value bytes from file instead of VALUE")
+	versionPutCmd.Flags().BoolVar(&vcsValueStdin, "stdin", false, "read value bytes from standard input instead of VALUE")
 	auditOperationsCmd.Flags().Uint64Var(&vcsSince, "since", 0, "only show operations after logical clock")
 	gitCmd.PersistentFlags().StringVar(&vcsAuditDir, "audit-dir", "", "audit Git worktree path")
 	gitPushCmd.Flags().StringVar(&vcsRemote, "remote", "", "Git remote name")
 	gitPushCmd.Flags().StringVar(&vcsBranch, "branch", "", "Git branch")
+	gitExportCmd.Flags().BoolVar(&vcsIncludeFailed, "include-failed", true, "retry failed exports as well as pending exports")
 	softServeCmd.PersistentFlags().StringVar(&vcsAuditDir, "audit-dir", "", "audit Git worktree path")
 	softServeRemoteSetCmd.Flags().StringVar(&vcsRemote, "remote", "origin", "Git remote name")
 	softServeRemoteTestCmd.Flags().StringVar(&vcsRemote, "ssh-url", "", "Soft Serve SSH URL")
 
 	versionCmd.AddCommand(versionPutCmd, versionGetCmd, versionDeleteCmd, versionHistoryCmd, versionShowCmd, versionRollbackCmd)
 	auditCmd.AddCommand(auditOperationsCmd, auditOperationCmd, auditPendingCmd, auditFailedCmd, auditRetryCmd)
-	gitCmd.AddCommand(gitStatusCmd, gitPushCmd)
+	gitCmd.AddCommand(gitStatusCmd, gitExportCmd, gitPushCmd)
 	softServeRemoteCmd.AddCommand(softServeRemoteSetCmd, softServeRemoteTestCmd)
 	softServeCmd.AddCommand(softServeRemoteCmd)
 	RootCmd.AddCommand(versionCmd, auditCmd, gitCmd, softServeCmd)
 }
 
 var versionCmd = &cobra.Command{Use: "version", Short: "Versioned key-value operations"}
-var versionPutCmd = &cobra.Command{Use: "put KEY VALUE", Args: cobra.ExactArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
+var versionPutCmd = &cobra.Command{Use: "put KEY [VALUE]", Args: cobra.RangeArgs(1, 2), RunE: func(cmd *cobra.Command, args []string) error {
+	value, err := readPutValue(args)
+	if err != nil {
+		return err
+	}
 	db, close, err := openVersionDB(false)
 	if err != nil {
 		return err
 	}
 	defer close()
-	rec, err := db.Put(args[0], []byte(args[1]))
+	rec, err := db.Put(args[0], value)
 	if err != nil {
 		return err
 	}
@@ -81,8 +93,8 @@ var versionGetCmd = &cobra.Command{Use: "get KEY", Args: cobra.ExactArgs(1), Run
 	return printValue(val)
 }}
 var versionDeleteCmd = &cobra.Command{Use: "delete KEY", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-	if !vcsYes {
-		return errors.New("delete requires --yes in non-interactive mode")
+	if err := confirmAction("delete"); err != nil {
+		return err
 	}
 	db, close, err := openVersionDB(false)
 	if err != nil {
@@ -120,8 +132,8 @@ var versionShowCmd = &cobra.Command{Use: "show KEY VERSION_ID", Args: cobra.Exac
 	return printAny(rec)
 }}
 var versionRollbackCmd = &cobra.Command{Use: "rollback KEY VERSION_ID", Args: cobra.ExactArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
-	if !vcsYes {
-		return errors.New("rollback requires --yes in non-interactive mode")
+	if err := confirmAction("rollback"); err != nil {
+		return err
 	}
 	db, close, err := openVersionDB(false)
 	if err != nil {
@@ -207,6 +219,34 @@ var gitStatusCmd = &cobra.Command{Use: "status", RunE: func(cmd *cobra.Command, 
 	}
 	return printAny(st)
 }}
+var gitExportCmd = &cobra.Command{Use: "export", RunE: func(cmd *cobra.Command, args []string) error {
+	db, close, err := openVersionDB(false)
+	if err != nil {
+		return err
+	}
+	defer close()
+	pending, err := db.ListExportPending(vcsLimit)
+	if err != nil {
+		return err
+	}
+	ops := pending
+	if vcsIncludeFailed {
+		failed, err := db.ListExportFailed(vcsLimit)
+		if err != nil {
+			return err
+		}
+		ops = append(ops, failed...)
+	}
+	var exported, failedCount int
+	for _, op := range ops {
+		if err := db.RetryExport(op.OperationID); err != nil {
+			failedCount++
+			continue
+		}
+		exported++
+	}
+	return printAny(map[string]any{"exported": exported, "failed": failedCount})
+}}
 var gitPushCmd = &cobra.Command{Use: "push", RunE: func(cmd *cobra.Command, args []string) error { return gitExporter().GitPush(vcsRemote, vcsBranch) }}
 
 var softServeCmd = &cobra.Command{Use: "softserve", Short: "Configure Soft Serve audit mirror remotes"}
@@ -242,11 +282,82 @@ func gitExporter() versioning.GitExporter {
 	return versioning.GitExporter{FilesystemExporter: versioning.FilesystemExporter{Root: auditDir()}, Commit: true}
 }
 func printAny(v any) error {
-	b, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
+	if vcsOutput == "json" {
+		b, err := json.MarshalIndent(v, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(b))
+		return nil
+	}
+	switch x := v.(type) {
+	case *versioning.VersionRecord:
+		printVersionRecord(*x)
+	case versioning.VersionRecord:
+		printVersionRecord(x)
+	case *versioning.OperationRecord:
+		printOperationRecord(*x)
+	case []versioning.VersionRecord:
+		for _, rec := range x {
+			printVersionRecord(rec)
+		}
+	case []versioning.OperationRecord:
+		for _, op := range x {
+			printOperationRecord(op)
+		}
+	default:
+		b, err := json.MarshalIndent(v, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(b))
+	}
+	return nil
+}
+func printVersionRecord(rec versioning.VersionRecord) {
+	fmt.Printf("version=%s key=%q op=%s clock=%d tombstone=%t size=%d hash=%s parent=%s\n", rec.VersionID, rec.Key, rec.Operation, rec.LogicalClock, rec.Tombstone, rec.ValueSize, rec.ValueHash, rec.ParentVersionID)
+}
+func printOperationRecord(op versioning.OperationRecord) {
+	fmt.Printf("op=%s type=%s key=%q version=%s clock=%d host=%s export=%s tombstone=%t\n", op.OperationID, op.Type, op.Key, op.VersionID, op.LogicalClock, op.HostID, op.ExportState, op.Tombstone)
+}
+func readPutValue(args []string) ([]byte, error) {
+	modes := 0
+	if len(args) == 2 {
+		modes++
+	}
+	if vcsValueFile != "" {
+		modes++
+	}
+	if vcsValueStdin {
+		modes++
+	}
+	if modes != 1 {
+		return nil, errors.New("provide exactly one VALUE, --value-file, or --stdin")
+	}
+	if vcsValueFile != "" {
+		return os.ReadFile(vcsValueFile)
+	}
+	if vcsValueStdin {
+		return io.ReadAll(os.Stdin)
+	}
+	return []byte(args[1]), nil
+}
+func confirmAction(action string) error {
+	if vcsYes {
+		return nil
+	}
+	info, err := os.Stdin.Stat()
+	if err != nil || (info.Mode()&os.ModeCharDevice) == 0 {
+		return fmt.Errorf("%s requires --yes in non-interactive mode", action)
+	}
+	fmt.Fprintf(os.Stderr, "Confirm %s? Type 'yes' to continue: ", action)
+	var response string
+	if _, err := fmt.Fscan(os.Stdin, &response); err != nil {
 		return err
 	}
-	fmt.Println(string(b))
+	if strings.ToLower(strings.TrimSpace(response)) != "yes" {
+		return fmt.Errorf("%s cancelled", action)
+	}
 	return nil
 }
 func encodeValue(v []byte) any {

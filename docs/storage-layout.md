@@ -13,11 +13,12 @@ The versioning layer uses reserved Badger key prefixes so Phase 1 remains cleanl
 /ops/global/{logicalClock}-{operationID}
 /ops/by-key/{encodedKey}/{logicalClock}-{operationID}
 /ops/by-id/{operationID}
+/export/state/{state}/{logicalClock}-{operationID}
 ```
 
 ## Schema and compatibility
 
-`/meta/schema/version` is set to the Phase 1 schema version. PR #1 data used raw keys and no durable host/clock metadata. This follow-up uses encoded keys for all new writes. Compatibility reads for PR #1 data are intentionally not automatic because raw-key paths can be ambiguous and could collide with internal prefixes. Existing PR #1 databases should be exported or migrated intentionally before using this layout.
+`/meta/schema/version` is set to the Phase 1 schema version. PR #1 data used raw keys and no durable host/clock metadata. This follow-up uses encoded keys for all new writes. Compatibility reads for PR #1 data are intentionally not automatic because raw-key paths can be ambiguous and could collide with internal prefixes. Existing PR #1 databases are rejected with a typed incompatible-schema error when legacy data is detected; export or migrate them intentionally before using this layout.
 
 ## Current pointer
 
@@ -33,7 +34,7 @@ The versioning layer uses reserved Badger key prefixes so Phase 1 remains cleanl
 
 ## Operation log
 
-The global operation log is ordered by logical clock. Per-key and by-ID indexes point to the same serialized operation state, including export status.
+The global operation log is ordered by logical clock. Per-key, by-ID, and export-state indexes point to the same serialized operation state, including export status.
 
 ## Reserved prefixes
 
